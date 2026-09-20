@@ -27,7 +27,7 @@
 # AUTOMATION HOOK
 #   Writing one line to runtime/petcmd.txt makes the running pet execute it:
 #     quit | say | state | diag | shot | reload | reset | menu | linetest | geom |
-#     monrefresh | saytext:<t> | sayfrom:<pool> | pose:<name> | screen:<idx> |
+#     monrefresh | rtss | saytext:<t> | sayfrom:<pool> | pose:<name> | screen:<idx> |
 #     uclick:<comp> | udrag:<comp>:<dx>:<dy> | uwheel:<delta> | hittest:<comp>
 #   Used by tools/smoke_test.ps1 and usable for manual checks.
 # ===========================================================================
@@ -1740,6 +1740,114 @@ $emoTimer.Start()
 # ---------------------------------------------------------------------------
 # 11. panel refresh / topmost re-assert / RTSS guard / petcmd / menu
 # ---------------------------------------------------------------------------
+# RTSS lifecycle + autostart helpers. They must live BEFORE the first top-level
+# use (startup call in section 13, guard tick below, menu + shutdown handlers).
+function Get-RtssExe {
+  # RTSS installs to a fixed official location; absence simply means the FPS
+  # feature keeps its "refresh rate" fallback (behaviour unchanged).
+  $rtssPath = Join-Path ${env:ProgramFiles(x86)} 'RivaTuner Statistics Server\RTSS.exe'
+  if (Test-Path $rtssPath) { return $rtssPath }
+  return ''
+}
+
+function New-RtssShortcut {
+  # Desktop shortcut for RTSS so the user can always start it by hand.
+  # Idempotent: skipped when made once (marker in runtime\) or the .lnk exists.
+  try {
+    $rscMark = Join-Path $script:Run 'rtss_shortcut.created'
+    if (Test-Path $rscMark) { return }
+    $rscDesk = [Environment]::GetFolderPath('Desktop')
+    if ($rscDesk) {
+      $rscPath = Join-Path $rscDesk ((U 'rtssShortcutName' 'RTSS FPS Tool') + '.lnk')
+      if (-not (Test-Path $rscPath)) {
+        $rscExe = Get-RtssExe
+        if ($rscExe -ne '') {
+          $rsc = New-Object -ComObject WScript.Shell
+          $rscLnk = $rsc.CreateShortcut($rscPath)
+          $rscLnk.TargetPath = $rscExe
+          $rscLnk.WorkingDirectory = (Split-Path -Parent $rscExe)
+          $rscLnk.Save()
+          [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($rsc)
+          Log 'rtss desktop shortcut created'
+        }
+      }
+      Set-Content -Path $rscMark -Value '1' -Encoding ASCII
+    }
+  } catch { Log ("rtss shortcut err: " + $_.Exception.Message) }
+}
+
+function Ensure-Rtss {
+  # Called once at startup: if RTSS is installed but not running, start it.
+  # This makes game FPS work on machines where RTSS did not register its own
+  # autostart; needs no scheduled task and no admin rights.
+  try {
+    $re = Get-RtssExe
+    if ($re -eq '') { return }
+    if (Get-Process RTSS -ErrorAction SilentlyContinue) { return }
+    Start-Process -FilePath $re
+    Log 'rtss not running -> started by pet'
+    New-RtssShortcut
+  } catch { Log ("ensure-rtss err: " + $_.Exception.Message) }
+}
+
+function Start-RtssDirect {
+  # guard revive without the scheduled task (no admin needed); harmless no-op
+  # when RTSS is already running or not installed
+  try {
+    $rtssExe = Get-RtssExe
+    if ($rtssExe -eq '') { return }
+    if (Get-Process RTSS -ErrorAction SilentlyContinue) { return }
+    Start-Process -FilePath $rtssExe
+    Log 'rtss revived directly by pet guard'
+  } catch { Log ("rtss direct start err: " + $_.Exception.Message) }
+}
+
+function Stop-Rtss {
+  # Called on real shutdown (not on the 'reload' handoff): the pet owns the
+  # RTSS lifetime. RTSS itself runs elevated (official requirement), so this
+  # stop can be denied by the OS; then RTSS keeps running and the user closes
+  # it from its own tray - logged, never an error, exit is never delayed long.
+  try {
+    $rp = Get-Process RTSS -ErrorAction SilentlyContinue
+    if ($rp) {
+      $rids = ($rp | ForEach-Object { $_.Id }) -join ','
+      $rp | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Milliseconds 500
+      if (Get-Process RTSS -ErrorAction SilentlyContinue) {
+        Log ("rtss stop denied (RTSS runs elevated), left running (pids=" + $rids + ")")
+      } else {
+        Log ("rtss stopped with pet (pids=" + $rids + ")")
+      }
+    }
+  } catch { Log ("stop-rtss err: " + $_.Exception.Message) }
+}
+
+function Test-Autostart {
+  try {
+    $runVal = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'ZZZSunnaMonitor' -ErrorAction SilentlyContinue
+    return ($null -ne $runVal)
+  } catch { return $false }
+}
+
+function Set-Autostart([bool]$on) {
+  # HKCU Run only: no admin needed, and it never touches the elevated guard
+  # task (that one is managed separately via daemon\register_task.ps1).
+  try {
+    $rk = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if ($on) {
+      New-ItemProperty -Path $rk -Name 'ZZZSunnaMonitor' -Value ('wscript.exe "' + (Join-Path $script:Root 'daemon\pet_launcher.vbs') + '"') -PropertyType String -Force | Out-Null
+      Log 'autostart ON (HKCU Run ZZZSunnaMonitor)'
+    } else {
+      Remove-ItemProperty -Path $rk -Name 'ZZZSunnaMonitor' -ErrorAction SilentlyContinue
+      Log 'autostart OFF'
+    }
+    return $true
+  } catch {
+    Log ("autostart err: " + $_.Exception.Message)
+    return $false
+  }
+}
+
 $script:LastModeLog = ''
 $script:TickN = 0
 
@@ -1855,6 +1963,10 @@ $rtssGuard.Add_Tick({
     if ($script:RtssMiss -ge 30 -and $script:RtssTries -lt 3) {
       $script:RtssTries++
       $script:RtssMiss = 0
+      # direct start first: works on fresh user machines with no elevated guard
+      # task; the task handoff below stays for setups where it is registered
+      # (both are idempotent - they only start RTSS when it is not running)
+      Start-RtssDirect
       Set-Content -Path (Join-Path $script:Run 'command.txt') -Value 'start-rtss' -Encoding UTF8
       $script:RtssCmdAt = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
       Start-Process -FilePath 'schtasks.exe' -ArgumentList '/run', '/tn', 'ZZZSunnaMonitor_RTSS' -WindowStyle Hidden
@@ -1943,6 +2055,16 @@ $script:CmdTimer.Add_Tick({
       Log ("linetest done: {0} lines, {1} below 55% of base font (avail {2}x{3} at base {4})" -f $ltTot, $ltBad, [int]$script:BubAvailW, [int]$script:BubAvailH, [Math]::Round($ltBase, 2))
     }
     elseif ($cmd -eq 'shot') { & $script:ShotAll }
+    elseif ($cmd -eq 'rtss') {
+      # report RTSS state, then run the same ensure path as startup
+      $re2 = Get-RtssExe
+      $rp2 = Get-Process RTSS -ErrorAction SilentlyContinue
+      Log ("rtss cmd: exe=" + $(if ($re2 -ne '') { $re2 } else { 'NOT-FOUND' }) +
+        " proc=" + $(if ($rp2) { ($rp2 | ForEach-Object { $_.Id }) -join ',' } else { 'none' }) +
+        " shm=" + $(if ([WhalePerf]::RtssOk) { 'ok' } else { 'down' }) +
+        " autostart=" + $(if (Test-Autostart) { 'on' } else { 'off' }))
+      Ensure-Rtss
+    }
     elseif ($cmd.StartsWith('pose:')) { $n = $cmd.Substring(5).Trim(); if (Set-Pose $n) { Log ("pose -> " + $n + " (cmd)") } }
     elseif ($cmd.StartsWith('screen:')) { $ix = 0; if ([int]::TryParse($cmd.Substring(7).Trim(), [ref]$ix)) { Set-Screen $ix } }
     elseif ($cmd.StartsWith('uclick:')) { $kd = $cmd.Substring(7).Trim(); Log ("uclick " + $kd); Invoke-Click $kd }
@@ -2057,6 +2179,15 @@ $script:ShowMenu = {
           foreach ($k in $script:CompsAll) { $script:Wins[$k].Topmost = $script:Topmost }
           Save-Cfg; Log ("topmost -> " + $script:Topmost)
         } },
+      @{ h = $(if (Test-Autostart) { (U 'menuAutoOn' 'Autostart: ON') } else { (U 'menuAutoOff' 'Autostart: OFF') }); a = {
+          $asNew = -not (Test-Autostart)
+          if (Set-Autostart $asNew) {
+            if ($asNew) { Show-Bubble (U 'autoOnMsg' 'Autostart is ON - see you next boot!') }
+            else { Show-Bubble (U 'autoOffMsg' 'Autostart is OFF.') }
+          } else {
+            Show-Bubble (U 'autoErrMsg' 'Could not change autostart.')
+          }
+        } },
       @{ h = (U 'menuQuit' 'Quit'); a = { $script:Closing = 'menu'; $script:Wins.pet.Close() } }
     )
     foreach ($m in $mk) {
@@ -2077,7 +2208,11 @@ $script:Closing = 'window closed'
 $petWin.Add_Closed({
   try {
     $script:CmdTimer.Stop(); $panelTimer.Stop(); $emoTimer.Stop(); $rtssGuard.Stop(); $hideTimer.Stop(); $animTimer.Stop(); $lineTimer.Stop()
+    try { $rtssStartTimer.Stop() } catch { }
     [WhalePerf]::Stop()
+    # the pet owns the RTSS lifetime: real shutdown stops RTSS with it - except
+    # on 'reload', where a fresh instance takes over and RTSS must survive
+    if ($script:Closing -ne 'reload') { Stop-Rtss }
     try { Remove-Item $script:PidF -Force -ErrorAction SilentlyContinue } catch { }
     Log ("pet v1 closed (" + $script:Closing + ")")
     try { $mutex.ReleaseMutex() } catch { }
@@ -2121,6 +2256,18 @@ Log ("gpu src=" + [WhalePerf]::GpuSrc + " nvml=" + [WhalePerf]::NvmlOk + " | rts
 $petWin.Show()
 [WpmDpi]::NoTaskbar($script:Hwnd.pet)
 try { [void]$petWin.Activate() } catch { }
+
+# RTSS lifecycle: if installed, make sure it is running - covers machines where
+# RTSS missed its own autostart (fresh user installs). Deferred a few seconds
+# into the message loop: starting a process (and the COM shortcut call) must
+# NOT delay Dispatcher.Run(), or the first paint and window enumeration lag.
+$rtssStartTimer = New-Object System.Windows.Threading.DispatcherTimer
+$rtssStartTimer.Interval = [TimeSpan]::FromSeconds(3)
+$rtssStartTimer.Add_Tick({
+  try { Ensure-Rtss } catch { }
+  try { $rtssStartTimer.Stop() } catch { }
+})
+$rtssStartTimer.Start()
 
 # Auto-create a desktop shortcut once, on first launch of a fresh copy: the pet
 # itself already sits ON the desktop, so the shortcut only matters for relaunch

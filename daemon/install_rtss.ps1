@@ -8,13 +8,40 @@ $ErrorActionPreference = 'Stop'
 $root    = Split-Path -Parent $PSScriptRoot
 $rtssExe = Join-Path ${env:ProgramFiles(x86)} 'RivaTuner Statistics Server\RTSS.exe'
 
+# Desktop shortcut for RTSS (same name the pet uses, from assets\ui.json) so
+# the user can always start it by hand. Idempotent.
+function New-RtssShortcutLocal {
+  try {
+    $uiJson = Join-Path $root 'assets\ui.json'
+    $scName = 'RTSS FPS Tool'
+    if (Test-Path $uiJson) {
+      try { $scName = [string]((Get-Content $uiJson -Raw -Encoding UTF8 | ConvertFrom-Json).'rtssShortcutName') } catch { }
+    }
+    if (-not $scName) { $scName = 'RTSS FPS Tool' }
+    $desk = [Environment]::GetFolderPath('Desktop')
+    if ($desk) {
+      $scPath = Join-Path $desk ($scName + '.lnk')
+      if (-not (Test-Path $scPath)) {
+        $sc = New-Object -ComObject WScript.Shell
+        $lnk = $sc.CreateShortcut($scPath)
+        $lnk.TargetPath = $rtssExe
+        $lnk.WorkingDirectory = (Split-Path -Parent $rtssExe)
+        $lnk.Save()
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sc)
+        Write-Host ('[OK] Desktop shortcut created: ' + $scName)
+      }
+    }
+  } catch { Write-Host '[WARN] Could not create the desktop shortcut.' }
+}
+
 if (Test-Path $rtssExe) {
   Write-Host ''
   Write-Host '[OK] RTSS is already installed on this computer.'
   if (-not (Get-Process RTSS -ErrorAction SilentlyContinue)) {
     try { Start-Process -FilePath $rtssExe; Write-Host '[OK] RTSS started.' } catch { }
   }
-  Write-Host '[OK] Nothing else to do - game FPS will show on the pet panel.'
+  New-RtssShortcutLocal
+  Write-Host '[OK] The pet starts RTSS automatically whenever it runs - nothing else to do.'
   exit 0
 }
 
@@ -53,9 +80,11 @@ try {
 Start-Sleep -Seconds 3
 if (Test-Path $rtssExe) {
   try { Start-Process -FilePath $rtssExe } catch { }
+  New-RtssShortcutLocal
   Write-Host ''
   Write-Host '[OK] RTSS installed and started.'
-  Write-Host '[OK] It will start with Windows from now on - no settings needed.'
+  Write-Host '[OK] The pet will start RTSS automatically whenever it runs -'
+  Write-Host '     and stop it when you quit the pet. No settings needed.'
   Write-Host '[OK] Tip: restart the PC once, then start a game - the pet panel'
   Write-Host '     will show the real in-game FPS.'
 } else {

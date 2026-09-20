@@ -15,6 +15,12 @@
   "menuScreen": "🔀 切换监控屏（泡泡酱）",
   "menuTop": "📌 置顶",
   "menuUntop": "📌 取消置顶",
+  "menuAutoOn": "🚀 开机自启：已开启（点击关闭）",
+  "menuAutoOff": "🚀 开机自启：未开启（点击开启）",
+  "autoOnMsg": "好耶～开机自启打开了，下次开机我自己来上岗！",
+  "autoOffMsg": "好的～开机自启关闭了，想我就双击桌面的快捷方式哦",
+  "autoErrMsg": "呜…开机自启没设置成功，可能被安全软件拦住了",
+  "rtssShortcutName": "RTSS 帧数工具",
   "menuQuit": "👋 退出",
   "shortcutName": "性能监视桌宠"
 }
